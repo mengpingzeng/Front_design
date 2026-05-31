@@ -3,6 +3,9 @@ import type { WSEvent } from "@/types"
 
 const WS_BASE = process.env.NEXT_PUBLIC_WS_BASE || ""
 
+/** 任务详情页聊天 WebSocket（含自动重连）。false 时页面不连接，改由 HTTP 轮询拉回复 */
+export const TASK_DETAIL_CHAT_WS_ENABLED = false
+
 const MAX_RECONNECT_ATTEMPTS = 5
 const BASE_DELAY_MS = 1000
 

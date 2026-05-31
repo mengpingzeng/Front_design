@@ -9,7 +9,12 @@ import {
   stopTask, fetchTaskMessages, clearTaskMessages,
   getBookInfo, getBookContent, fetchTaskPublishList,
 } from "@/lib/api"
-import { connectChatTaskWS, connectTaskWS, type WSController } from "@/lib/ws"
+import {
+  connectChatTaskWS,
+  connectTaskWS,
+  TASK_DETAIL_CHAT_WS_ENABLED,
+  type WSController,
+} from "@/lib/ws"
 import type { SessionMessage, WSEvent, BookInfoResponse, PublishRecord } from "@/types"
 import { Send, Loader2, CheckCircle, AlertCircle, ArrowLeft, Trash2, Plus, ChevronRight, ChevronDown } from "lucide-react"
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription, DialogFooter } from "@/components/ui/dialog"
@@ -572,7 +577,14 @@ export default function SessionPage() {
     try {
       if (tid) {
         try {
-          const { messages, hasReply: found } = await fetchTaskMessagesWithRetry(tid, baseline)
+          const pollAttempts = TASK_DETAIL_CHAT_WS_ENABLED ? 5 : 90
+          const pollInterval = TASK_DETAIL_CHAT_WS_ENABLED ? 300 : 1000
+          const { messages, hasReply: found } = await fetchTaskMessagesWithRetry(
+            tid,
+            baseline,
+            pollAttempts,
+            pollInterval,
+          )
           const lastAi = [...(messages || [])].reverse().find((m) => m.role === "assistant")
           if (lastAi && shouldRefreshBookInfoAfterAiReply(lastAi.text)) {
             void refreshBookInfoRef.current({ syncSessionId: sessionIdRef.current })
@@ -619,7 +631,7 @@ export default function SessionPage() {
   novelNameLockedRef.current = novelNameLocked
 
   const startWS = useCallback(async () => {
-    if (!taskId) return
+    if (!TASK_DETAIL_CHAT_WS_ENABLED || !taskId) return
     wsRef.current?.close()
     const ws = connectChatTaskWS(
       taskId,
@@ -746,9 +758,9 @@ export default function SessionPage() {
     void loadPage()
   }, [taskId, sessionIdFromQuery])
 
-  // 任务详情页只建立一条 task 级 WebSocket
+  // 任务详情页 task 级 WebSocket（TASK_DETAIL_CHAT_WS_ENABLED 为 false 时不连接）
   useEffect(() => {
-    if (!taskId) return
+    if (!taskId || !TASK_DETAIL_CHAT_WS_ENABLED) return
     startWS()
     return () => {
       wsRef.current?.close()
@@ -834,6 +846,9 @@ export default function SessionPage() {
         draft_version: draftVersion,
         mode,
       })
+      if (!TASK_DETAIL_CHAT_WS_ENABLED) {
+        void finalizeStreamingTurnRef.current(sessionIdRef.current)
+      }
     } catch (err) {
       setTaskMessages((prev) => prev.filter(msg => msg.id !== mid))
       setPendingAssistant(null)
@@ -1125,7 +1140,7 @@ export default function SessionPage() {
                 </div>
               </div>
             )}
-            {wsReconnecting && !streaming && (
+            {TASK_DETAIL_CHAT_WS_ENABLED && wsReconnecting && !streaming && (
               <div className="flex justify-center">
                 <span className="text-xs text-orange-500 bg-orange-50 border border-orange-200 px-3 py-1 rounded-full flex items-center gap-1.5">
                   <Loader2 className="w-3 h-3 animate-spin" />
