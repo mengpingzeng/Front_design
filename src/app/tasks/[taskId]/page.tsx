@@ -5,24 +5,39 @@ import { useParams, useSearchParams, useRouter } from "next/navigation"
 import { AnimatePresence, motion } from "framer-motion"
 import { toast } from "sonner"
 import {
-  sendTaskMessage, publishTask, fetchTask,
+  sendTaskMessage, publishTask, fetchTask, fetchAccounts,
   stopTask, fetchTaskMessages, clearTaskMessages,
-  getBookInfo, getBookContent, fetchTaskPublishList,
+  getBookInfo, getBookContent,
 } from "@/lib/api"
+import { getPlatformLabel } from "@/lib/platform-label"
 import {
   connectChatTaskWS,
   connectTaskWS,
   TASK_DETAIL_CHAT_WS_ENABLED,
   type WSController,
 } from "@/lib/ws"
-import type { SessionMessage, WSEvent, BookInfoResponse, PublishRecord } from "@/types"
+import type { SessionMessage, WSEvent, BookInfoResponse, BookChapter, BookChapterPhase } from "@/types"
 import { Send, Loader2, CheckCircle, AlertCircle, ArrowLeft, Trash2, Plus, ChevronRight, ChevronDown } from "lucide-react"
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription, DialogFooter } from "@/components/ui/dialog"
 import { Select as SelectRadix, SelectItem } from "@/components/ui/select"
-import { cn, formatChapterLabel, shouldRefreshBookInfoAfterAiReply } from "@/lib/utils"
+import {
+  cn,
+  formatChapterLabel,
+  resolveBookChapterPhase,
+  isBookChapterPublished,
+} from "@/lib/utils"
 import { chatDisplayText } from "@/lib/chat-display"
 import { resolveTaskListReturnUrl } from "@/lib/task-navigation"
 import { getAuthUser } from "@/lib/auth"
+import { notifyNewChaptersIfAny } from "@/lib/chapter-update-notify"
+import { BookChapterContent } from "@/components/book-chapter-content"
+import {
+  buildDisplayBookContent,
+  resolveHeaderChapterTitle,
+} from "@/lib/book-content-display"
+
+/** 停留在任务详情页期间，定时刷新左侧章节列表（与是否在等 AI 回复无关） */
+const BOOK_INFO_POLL_INTERVAL_MS = 15_000
 
 function parseMessageTime(timestamp?: string): Date | null {
   if (!timestamp) return null
@@ -56,21 +71,15 @@ function formatChatTime(timestamp?: string): string {
   return `${dateText} ${time}`
 }
 
-function ChapterStatusBadge({
-  published,
-  draftVersion,
-}: {
-  published: boolean
-  draftVersion: number
-}) {
-  if (published) {
+function ChapterStatusBadge({ phase }: { phase: BookChapterPhase | null }) {
+  if (phase === "published") {
     return (
       <span className="shrink-0 rounded px-1.5 py-0.5 text-[10px] font-medium bg-emerald-50 text-emerald-600">
         已发布
       </span>
     )
   }
-  if (draftVersion > 0) {
+  if (phase === "draft") {
     return (
       <span className="shrink-0 rounded px-1.5 py-0.5 text-[10px] font-medium bg-orange-50 text-orange-600">
         有草稿
@@ -82,6 +91,15 @@ function ChapterStatusBadge({
       无草稿
     </span>
   )
+}
+
+function findBookChapter(bookInfo: BookInfoResponse | null, sessionId: string): BookChapter | undefined {
+  if (!bookInfo?.volumes) return undefined
+  for (const vol of bookInfo.volumes) {
+    const ch = vol.chapters.find((c) => c.session_id === sessionId)
+    if (ch) return ch
+  }
+  return undefined
 }
 
 function shouldShowMessageTime(messages: SessionMessage[], index: number) {
@@ -243,6 +261,7 @@ export default function SessionPage() {
   const [volumeName, setVolumeName] = useState("第一卷")
   const [chapterNumber, setChapterNumber] = useState(1)
   const [lockedAccountId, setLockedAccountId] = useState("")
+  const [publishAccountDisplay, setPublishAccountDisplay] = useState("")
 
   const [activeChapter, setActiveChapter] = useState<string>("")
   const [chapterDraft, setChapterDraft] = useState("")
@@ -258,16 +277,12 @@ export default function SessionPage() {
   const bookContentRequestRef = useRef(0)
   const [expandedVolumes, setExpandedVolumes] = useState<Set<string>>(new Set())
   const [selectedChapter, setSelectedChapter] = useState<{ volumeName: string; chapterNumber: number; sessionId: string; chapterTitle: string; status: string } | null>(null)
-  const [publishedSessionIds, setPublishedSessionIds] = useState<Set<string>>(() => new Set())
-
-  const syncPublishState = useCallback((items: PublishRecord[], info: BookInfoResponse | null) => {
-    const ids = new Set(items.map((i) => i.sessionId).filter(Boolean))
-    setPublishedSessionIds(ids)
+  const syncChapterNumberFromBookInfo = useCallback((info: BookInfoResponse | null) => {
     let maxPublishedChapter = 0
     if (info?.volumes) {
       for (const vol of info.volumes) {
         for (const ch of vol.chapters) {
-          if (ids.has(ch.session_id)) {
+          if (isBookChapterPublished(ch)) {
             maxPublishedChapter = Math.max(maxPublishedChapter, ch.chapter_number)
           }
         }
@@ -278,16 +293,28 @@ export default function SessionPage() {
 
   const chapters = useMemo(() => {
     if (!bookInfo) return []
-    const result: Array<{ sessionId: string; label: string; index: number; hasContent: boolean; chapterTitle?: string; published?: boolean; skillId?: string; model?: string }> = []
+    const result: Array<{
+      sessionId: string
+      label: string
+      index: number
+      hasContent: boolean
+      chapterTitle?: string
+      phase: BookChapterPhase | null
+      published: boolean
+      skillId?: string
+      model?: string
+    }> = []
     for (const vol of bookInfo.volumes) {
       for (const ch of vol.chapters) {
+        const phase = resolveBookChapterPhase(ch)
         result.push({
           sessionId: ch.session_id,
           label: formatChapterLabel(ch.chapter_number),
           index: ch.chapter_number,
-          hasContent: ch.draft_version > 0,
+          hasContent: phase !== null || ch.draft_version > 0,
           chapterTitle: ch.title || undefined,
-          published: publishedSessionIds.has(ch.session_id),
+          phase,
+          published: isBookChapterPublished(ch),
           skillId: taskSkillId,
           model: taskModel,
         })
@@ -295,7 +322,7 @@ export default function SessionPage() {
     }
     result.sort((a, b) => a.index - b.index)
     return result
-  }, [bookInfo, taskSkillId, taskModel, publishedSessionIds])
+  }, [bookInfo, taskSkillId, taskModel])
 
   /** 一键发布弹窗：最近已发布 / 下一章 / 待发布预览（最多 5 章） */
   const publishModalData = useMemo(() => {
@@ -352,10 +379,17 @@ export default function SessionPage() {
   const selectedChapterRef = useRef(selectedChapter)
   const novelNameLockedRef = useRef(novelNameLocked)
   const lastSendComposerModeRef = useRef<ComposerMode>("chat")
+  const knownChapterIdsRef = useRef<Set<string>>(new Set())
+  const chapterNotifySeededRef = useRef(false)
+  const lastBookInfoPollAtRef = useRef(0)
+  const bookInfoPollInFlightRef = useRef(false)
 
   const editTargetSessionId = selectedChapter?.sessionId || sessionId || activeChapter
-  const editTargetPublished = editTargetSessionId
-    ? publishedSessionIds.has(editTargetSessionId)
+  const editTargetChapter = editTargetSessionId
+    ? findBookChapter(bookInfo, editTargetSessionId)
+    : undefined
+  const editTargetPublished = editTargetChapter
+    ? isBookChapterPublished(editTargetChapter)
     : false
 
   const chapterStats = useMemo(() => {
@@ -365,11 +399,11 @@ export default function SessionPage() {
     for (const vol of bookInfo.volumes) {
       for (const ch of vol.chapters) {
         total += 1
-        if (publishedSessionIds.has(ch.session_id)) published += 1
+        if (isBookChapterPublished(ch)) published += 1
       }
     }
     return { total, published }
-  }, [bookInfo, publishedSessionIds])
+  }, [bookInfo])
 
   const chatStatus = useMemo(() => {
     if (wsReconnecting) return { label: "重连中", active: true }
@@ -523,12 +557,45 @@ export default function SessionPage() {
     return () => ro.disconnect()
   }, [])
 
-  /** 刷新章节列表；不切换当前查看章节，不重新加载右侧正文 */
-  const refreshBookInfo = useCallback(async (opts?: { syncSessionId?: string }) => {
-    if (!taskId) return
+  const applyChapterListUpdate = useCallback((info: BookInfoResponse) => {
+    const { nextKnown, nextSeeded } = notifyNewChaptersIfAny(
+      knownChapterIdsRef.current,
+      info,
+      chapterNotifySeededRef.current,
+    )
+    knownChapterIdsRef.current = nextKnown
+    chapterNotifySeededRef.current = nextSeeded
+    setBookInfo(info)
+    syncChapterNumberFromBookInfo(info)
+  }, [syncChapterNumberFromBookInfo])
+
+  /**
+   * 刷新章节列表；不切换当前查看章节，不重新加载右侧正文。
+   * scheduled：页面定时轮询，不走节流（避免与 15s 定时器叠加成约 30s 才请求一次）。
+   * force：首屏、发布成功等需立即刷新。
+   */
+  const refreshBookInfo = useCallback(async (opts?: {
+    syncSessionId?: string
+    force?: boolean
+    scheduled?: boolean
+  }): Promise<BookInfoResponse | null> => {
+    if (!taskId) return null
+    const now = Date.now()
+    if (
+      !opts?.force &&
+      !opts?.scheduled &&
+      lastBookInfoPollAtRef.current > 0 &&
+      now - lastBookInfoPollAtRef.current < BOOK_INFO_POLL_INTERVAL_MS
+    ) {
+      return null
+    }
+    if (bookInfoPollInFlightRef.current) return null
+
+    bookInfoPollInFlightRef.current = true
     try {
       const info = await getBookInfo(taskId)
-      setBookInfo(info)
+      lastBookInfoPollAtRef.current = Date.now()
+      applyChapterListUpdate(info)
       if (info.novel_name && !novelNameLocked) setNovelName(info.novel_name)
 
       const sel = selectedChapterRef.current
@@ -541,7 +608,7 @@ export default function SessionPage() {
               volumeName: sel.volumeName,
               chapterNumber: sel.chapterNumber,
               sessionId: ch.session_id,
-              chapterTitle: ch.title,
+              chapterTitle: ch.title ?? "",
               status: ch.status,
             })
             break
@@ -558,13 +625,46 @@ export default function SessionPage() {
           }
         }
       }
+      return info
     } catch {
-      // 静默失败，避免打断聊天流
+      return null
+    } finally {
+      bookInfoPollInFlightRef.current = false
     }
-  }, [taskId, novelNameLocked])
+  }, [taskId, novelNameLocked, applyChapterListUpdate])
 
   const refreshBookInfoRef = useRef(refreshBookInfo)
   refreshBookInfoRef.current = refreshBookInfo
+
+  useEffect(() => {
+    knownChapterIdsRef.current = new Set()
+    chapterNotifySeededRef.current = false
+    lastBookInfoPollAtRef.current = 0
+  }, [taskId])
+
+  useEffect(() => {
+    if (!taskId) return
+    let cancelled = false
+    let timer: ReturnType<typeof setTimeout>
+
+    const scheduleNextPoll = () => {
+      timer = setTimeout(async () => {
+        if (cancelled) return
+        await refreshBookInfoRef.current({
+          syncSessionId: sessionIdRef.current,
+          scheduled: true,
+        })
+        if (!cancelled) scheduleNextPoll()
+      }, BOOK_INFO_POLL_INTERVAL_MS)
+    }
+
+    scheduleNextPoll()
+
+    return () => {
+      cancelled = true
+      clearTimeout(timer)
+    }
+  }, [taskId])
 
   const finalizeStreamingTurn = useCallback(async (eventSessionId: string, options?: { skipEmptyToast?: boolean }) => {
     if (finalizeInFlightRef.current) return
@@ -585,12 +685,6 @@ export default function SessionPage() {
             pollAttempts,
             pollInterval,
           )
-          const lastAi = [...(messages || [])].reverse().find((m) => m.role === "assistant")
-          if (lastAi && shouldRefreshBookInfoAfterAiReply(lastAi.text)) {
-            void refreshBookInfoRef.current({ syncSessionId: sessionIdRef.current })
-          } else if (lastSendComposerModeRef.current === "edit") {
-            void refreshBookInfoRef.current({ syncSessionId: sessionIdRef.current })
-          }
           if (found || streamBuf) {
             showPendingReply(messages, streamBuf)
           } else {
@@ -758,6 +852,48 @@ export default function SessionPage() {
     void loadPage()
   }, [taskId, sessionIdFromQuery])
 
+  useEffect(() => {
+    if (!platform || !lockedAccountId) {
+      setPublishAccountDisplay("")
+      return
+    }
+    let cancelled = false
+    void (async () => {
+      try {
+        const accounts = await fetchAccounts(platform)
+        const acc = accounts.find((a) => a.account_id === lockedAccountId)
+        if (!cancelled) setPublishAccountDisplay(acc?.masked_display ?? "")
+      } catch {
+        if (!cancelled) setPublishAccountDisplay("")
+      }
+    })()
+    return () => {
+      cancelled = true
+    }
+  }, [platform, lockedAccountId])
+
+  const publishHeaderMeta = useMemo(() => {
+    if (!platform || !lockedAccountId || !publishAccountDisplay) return null
+    return `${getPlatformLabel(platform)} · ${publishAccountDisplay}`
+  }, [platform, lockedAccountId, publishAccountDisplay])
+
+  const headerChapterTitle = useMemo(
+    () =>
+      resolveHeaderChapterTitle(
+        selectedChapter?.chapterTitle || chapterTitle,
+        bookContent,
+      ),
+    [selectedChapter?.chapterTitle, chapterTitle, bookContent],
+  )
+
+  const displayBookContent = useMemo(() => {
+    if (!bookContent) return ""
+    return buildDisplayBookContent(bookContent, {
+      stripChapterLine: Boolean(selectedChapter),
+      stripTitleLine: Boolean(headerChapterTitle),
+    })
+  }, [bookContent, selectedChapter, headerChapterTitle])
+
   // 任务详情页 task 级 WebSocket（TASK_DETAIL_CHAT_WS_ENABLED 为 false 时不连接）
   useEffect(() => {
     if (!taskId || !TASK_DETAIL_CHAT_WS_ENABLED) return
@@ -769,23 +905,20 @@ export default function SessionPage() {
 
   useEffect(() => {
     if (!taskId) return
-    Promise.all([getBookInfo(taskId), fetchTaskPublishList(taskId)])
-      .then(([info, pub]) => {
-        setBookInfo(info)
-        if (info.novel_name) setNovelName(info.novel_name)
-        syncPublishState(pub.items, info)
-        const vols = Array.isArray(info?.volumes) ? info.volumes : []
-        if (vols.length > 0) {
-          const firstCh = vols[0].chapters[0]
-          setExpandedVolumes(new Set([vols[0].volume_name]))
-          if (firstCh && !sessionIdFromQuery) {
-            setActiveChapter(firstCh.session_id)
-            setSessionId(firstCh.session_id)
-          }
+    void refreshBookInfoRef.current({ force: true }).then((info) => {
+      if (!info) return
+      if (info.novel_name) setNovelName(info.novel_name)
+      const vols = Array.isArray(info.volumes) ? info.volumes : []
+      if (vols.length > 0) {
+        const firstCh = vols[0].chapters[0]
+        setExpandedVolumes(new Set([vols[0].volume_name]))
+        if (firstCh && !sessionIdFromQuery) {
+          setActiveChapter(firstCh.session_id)
+          setSessionId(firstCh.session_id)
         }
-      })
-      .catch(() => {})
-  }, [taskId, sessionIdFromQuery, syncPublishState])
+      }
+    })
+  }, [taskId, sessionIdFromQuery])
 
   const loadSelectedChapter = async (volName: string, chapNum: number) => {
     if (!taskId) return
@@ -907,12 +1040,7 @@ export default function SessionPage() {
         setPublishState("done"); publishStateRef.current = "done"
         if (novelName) setNovelNameLocked(true)
         try {
-          const [info, pub] = await Promise.all([
-            getBookInfo(taskId),
-            fetchTaskPublishList(taskId),
-          ])
-          setBookInfo(info)
-          syncPublishState(pub.items, info)
+          await refreshBookInfo({ force: true })
         } catch {
           // 发布已成功，刷新状态失败时下次进入页面会纠正
         }
@@ -973,10 +1101,18 @@ export default function SessionPage() {
           </button>
           <div className="flex items-center gap-3 min-w-0 pl-0.5">
             <span className="hidden sm:block w-1 h-8 rounded-full bg-gradient-to-b from-orange-500 to-amber-400 shrink-0" aria-hidden />
-            <div className="min-w-0">
-              <h1 className="text-lg font-bold text-slate-900 truncate leading-tight tracking-tight">
+            <div className="flex items-center gap-3 min-w-0">
+              <h1 className="text-lg font-bold text-slate-900 truncate leading-tight tracking-tight min-w-0 shrink">
                 {novelName || "未命名作品"}
               </h1>
+              {publishHeaderMeta ? (
+                <span
+                  className="text-sm font-medium text-slate-500 truncate shrink-0 max-w-[min(40vw,12rem)] sm:max-w-xs"
+                  title={publishHeaderMeta}
+                >
+                  {publishHeaderMeta}
+                </span>
+              ) : null}
             </div>
           </div>
         </div>
@@ -1281,12 +1417,12 @@ export default function SessionPage() {
                       <ul className="mt-1 mb-0.5 ml-3 space-y-0.5 border-l-2 border-slate-200/80 pl-2.5">
                         {vol.chapters.map((ch) => {
                           const sel = selectedChapter?.sessionId === ch.session_id
-                          const published = publishedSessionIds.has(ch.session_id)
+                          const chapterPhase = resolveBookChapterPhase(ch)
                           return (
                             <li key={ch.session_id}>
                               <button
                                 onClick={() => {
-                                  const info = { volumeName: vol.volume_name, chapterNumber: ch.chapter_number, sessionId: ch.session_id, chapterTitle: ch.title, status: ch.status }
+                                  const info = { volumeName: vol.volume_name, chapterNumber: ch.chapter_number, sessionId: ch.session_id, chapterTitle: ch.title ?? "", status: ch.status }
                                   setSelectedChapter(info)
                                   setActiveChapter(ch.session_id)
                                   setSessionId(ch.session_id)
@@ -1311,10 +1447,7 @@ export default function SessionPage() {
                                     ? `${formatChapterLabel(ch.chapter_number)} ${ch.title}`
                                     : formatChapterLabel(ch.chapter_number)}
                                 </span>
-                                <ChapterStatusBadge
-                                  published={published}
-                                  draftVersion={ch.draft_version}
-                                />
+                                <ChapterStatusBadge phase={chapterPhase} />
                               </button>
                             </li>
                           )
@@ -1335,28 +1468,17 @@ export default function SessionPage() {
           <div className="h-11 px-4 border-b border-slate-200 bg-white flex items-center justify-between gap-3 shrink-0 min-w-0">
             {selectedChapter ? (
               <>
-                <div className="min-w-0">
-                  <p className="text-sm font-semibold text-slate-800 truncate">
-                    {selectedChapter.volumeName} {formatChapterLabel(selectedChapter.chapterNumber)}
-                  </p>
-                  {selectedChapter.chapterTitle ? (
-                    <p className="text-[11px] text-slate-400 truncate mt-0.5">{selectedChapter.chapterTitle}</p>
+                <p className="min-w-0 text-sm font-semibold text-slate-800 truncate" title={headerChapterTitle ? `${selectedChapter.volumeName} ${formatChapterLabel(selectedChapter.chapterNumber)}：${headerChapterTitle}` : undefined}>
+                  {selectedChapter.volumeName} {formatChapterLabel(selectedChapter.chapterNumber)}
+                  {headerChapterTitle ? (
+                    <span className="font-normal text-slate-500">：{headerChapterTitle}</span>
                   ) : null}
-                </div>
+                </p>
                 {bookContentLoading ? (
                   <span className="shrink-0 flex items-center gap-1 text-[10px] font-medium text-slate-400">
                     <Loader2 size={11} className="animate-spin" />
                     加载中
                   </span>
-                ) : selectedChapter ? (
-                  <ChapterStatusBadge
-                    published={publishedSessionIds.has(selectedChapter.sessionId)}
-                    draftVersion={
-                      bookInfo?.volumes
-                        ?.flatMap((v) => v.chapters)
-                        .find((c) => c.session_id === selectedChapter.sessionId)?.draft_version ?? 0
-                    }
-                  />
                 ) : null}
               </>
             ) : (
@@ -1375,8 +1497,8 @@ export default function SessionPage() {
                 <p className="text-slate-600 text-sm">{bookContentError}</p>
               </div>
             ) : bookContent ? (
-              <div className="max-w-2xl mx-auto text-sm text-slate-700 leading-relaxed">
-                <p className="whitespace-pre-wrap">{bookContent}</p>
+              <div className="max-w-2xl mx-auto">
+                <BookChapterContent content={displayBookContent} />
               </div>
             ) : (
               <div className="max-w-2xl mx-auto text-center pt-24">
