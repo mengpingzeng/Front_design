@@ -56,6 +56,16 @@ export function formatChapterLabel(chapterNumber: number): string {
   return `第${toChineseNumber(chapterNumber)}章`
 }
 
+/** 卷名展示：第一卷；兼容「一卷」等缺少「第」的写法 */
+export function formatVolumeLabel(volumeName: string): string {
+  const v = volumeName.trim()
+  if (!v) return ""
+  if (/^第.+卷$/.test(v)) return v
+  const m = v.match(/^([0-9一二三四五六七八九十百千零两\d]+)卷$/)
+  if (m) return `第${m[1]}卷`
+  return v
+}
+
 /** 解析 book/info 返回的章节 phase（兼容仅含 published 布尔字段的旧响应） */
 export function resolveBookChapterPhase(ch: {
   phase?: string

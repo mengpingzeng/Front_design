@@ -303,6 +303,7 @@ export interface SessionMessage {
   role: "user" | "assistant" | "system"
   text: string
   timestamp: string
+  session_id?: string
   draft_version?: number
 }
 
